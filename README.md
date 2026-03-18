@@ -61,6 +61,7 @@ Traces redirects from the given URL and checks if the final domain is a partner 
 | `hops` | Total number of redirects followed |
 | `attempts` | Number of trace attempts made (due to retry logic) |
 | `is_partner` | `true` if the final domain matches a configured partner domain |
+| `js_rendered` | `true` if the ScrapingBee fallback was used to resolve the URL |
 | `proxy` | The proxy used (only present if a proxy was supplied) |
 
 **Error Response**
@@ -108,6 +109,24 @@ curl "http://localhost:3000/trace?url=https%3A%2F%2Fshort.example.com%2Fabc123&p
 | `MAX_RETRIES` | `3` | Max retry attempts if partner domain not found |
 | `RETRY_DELAY_MS` | `1000` | Delay between retries (ms) |
 | `TIMEOUT_MS` | `10000` | Per-request timeout (ms) |
+| `SCRAPINGBEE_API_KEY` | _(empty)_ | ScrapingBee API key for JS rendering fallback |
+| `ENABLE_JS_FALLBACK` | `false` | Set to `true` to enable ScrapingBee fallback |
+
+## ScrapingBee JS Rendering Fallback
+
+When the normal hop-by-hop trace is blocked (status `403`, `429`, `407`, `503`, or a connection-level failure), the API can fall back to ScrapingBee, which renders the URL in a real Chromium browser — bypassing Cloudflare and JS-driven redirects.
+
+**How it works:**
+1. Normal trace runs first (fast, no API credits used)
+2. If all `MAX_RETRIES` attempts result in a blocked status → ScrapingBee is called once
+3. ScrapingBee returns the final resolved URL via the `spb-resolved-url` response header
+4. That URL is checked against partner domains as usual
+
+**To enable:**
+1. Sign up at [scrapingbee.com](https://www.scrapingbee.com) and get your API key
+2. Set `SCRAPINGBEE_API_KEY=your_key` and `ENABLE_JS_FALLBACK=true` in your `.env`
+
+**Note:** ScrapingBee uses API credits per request. The fallback only fires when the direct trace is blocked, keeping credit usage minimal.
 
 ## Proxy Routing
 

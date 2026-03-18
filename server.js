@@ -17,6 +17,14 @@ const PARTNER_DOMAINS = (process.env.PARTNER_DOMAINS || "")
   .map((d) => d.trim().toLowerCase())
   .filter(Boolean);
 
+const SCRAPINGBEE_API_KEY = process.env.SCRAPINGBEE_API_KEY || "";
+const ENABLE_JS_FALLBACK = process.env.ENABLE_JS_FALLBACK === "true";
+
+// Status codes that indicate bot/Cloudflare blocking (trigger JS fallback)
+// 407 is intentionally excluded — it's a proxy config issue, not a site block
+const BLOCKED_STATUSES = new Set([403, 429, 503]);
+
+
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -229,6 +237,43 @@ function requestViaProxy(targetUrl, proxyUrl, referer) {
   });
 }
 
+// ─── ScrapingBee fallback ─────────────────────────────────────────────────────
+
+/**
+ * Use ScrapingBee to render the URL in a real Chromium browser and return the
+ * final resolved URL after all redirects (including JS-driven ones).
+ * Only called when the normal trace is blocked (403/429/etc).
+ */
+function scrapingBeeFallback(targetUrl) {
+  return new Promise((resolve, reject) => {
+    if (!SCRAPINGBEE_API_KEY) {
+      return reject(new Error("ScrapingBee API key not configured (SCRAPINGBEE_API_KEY)"));
+    }
+
+    const apiUrl = new URL("https://app.scrapingbee.com/api/v1/");
+    apiUrl.searchParams.set("api_key", SCRAPINGBEE_API_KEY);
+    apiUrl.searchParams.set("url", targetUrl);
+    apiUrl.searchParams.set("render_js", "true");
+    apiUrl.searchParams.set("return_page_source", "false");
+    apiUrl.searchParams.set("premium_proxy", "true");
+
+    const req = https.get(apiUrl.href, { timeout: TIMEOUT_MS * 3 }, (res) => {
+      res.resume();
+      const resolvedUrl = res.headers["spb-resolved-url"] || targetUrl;
+      const statusCode = res.statusCode;
+      resolve({ resolvedUrl, statusCode });
+    });
+
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("ScrapingBee request timed out"));
+    });
+    req.on("error", (err) =>
+      reject(new Error(`ScrapingBee request failed: ${err.message}`))
+    );
+  });
+}
+
 // ─── Redirect tracer ─────────────────────────────────────────────────────────
 
 function delay(ms) {
@@ -287,6 +332,7 @@ async function traceRedirects(startUrl, proxyUrl) {
 
     if (lastResult.found) {
       lastResult.attempts = attempt;
+      lastResult.js_rendered = false;
       return lastResult;
     }
 
@@ -296,6 +342,27 @@ async function traceRedirects(startUrl, proxyUrl) {
   }
 
   lastResult.attempts = MAX_RETRIES;
+
+  // ── ScrapingBee fallback ─────────────────────────────────────────────────
+  // Only trigger when there is evidence of bot blocking: explicit block codes
+  // (403, 429, 503) or a connection-level failure (null status).
+  // Non-partner results with a clean status (e.g. 200) are left as-is.
+  const wasBlocked = lastResult.status === null || BLOCKED_STATUSES.has(lastResult.status);
+
+  if (ENABLE_JS_FALLBACK && SCRAPINGBEE_API_KEY && wasBlocked) {
+    const { resolvedUrl, statusCode } = await scrapingBeeFallback(startUrl);
+    const found = isPartnerDomain(resolvedUrl);
+    return {
+      finalUrl: resolvedUrl,
+      status: statusCode,
+      hops: lastResult.hops,
+      attempts: lastResult.attempts,
+      is_partner: found,
+      js_rendered: true,
+    };
+  }
+
+  lastResult.js_rendered = false;
   return lastResult;
 }
 
@@ -331,7 +398,7 @@ app.get("/trace", async (req, res) => {
   }
 
   try {
-    const { finalUrl, status, hops, attempts, found } = await traceRedirects(url, proxy || null);
+    const { finalUrl, status, hops, attempts, found, js_rendered } = await traceRedirects(url, proxy || null);
 
     const response = {
       input_url: url,
@@ -340,6 +407,7 @@ app.get("/trace", async (req, res) => {
       hops,
       attempts,
       is_partner: found,
+      js_rendered,
     };
     if (proxy) response.proxy = proxy;
 
